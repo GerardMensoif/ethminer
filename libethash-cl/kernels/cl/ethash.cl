@@ -21,6 +21,9 @@
 #define OPENCL_PLATFORM_NVIDIA  3
 #define OPENCL_PLATFORM_INTEL   4
 
+// R5-specific constants
+#define LOOP_ACCESSES 64
+
 #if (defined(__Tahiti__) || defined(__Pitcairn__) || defined(__Capeverde__) || defined(__Oland__) || defined(__Hainan__))
 #define LEGACY
 #endif
@@ -252,6 +255,11 @@ do { \
 } while(0)
 #endif
 
+// R5-specific: Sequential dependency calculation
+uint fnv_seq_dep(uint seq_dep, uint mix_val) {
+    return fnv(seq_dep, mix_val);
+}
+
 // NOTE: This struct must match the one defined in CLMiner.cpp
 struct SearchResults {
     struct {
@@ -263,6 +271,20 @@ struct SearchResults {
     uint hashCount;
     uint abort;
 };
+
+// R5-specific: Modified target adjustment time and reward parameters
+#define TARGET_ADJUSTMENT_TIME 7   // Changed from 9 to 7 seconds
+#define DIFFICULTY_BOUND_DIVISOR 2048
+#define MINIMUM_DIFFICULTY 131072
+
+// R5-specific block reward constants
+__constant ulong REWARD_EPOCH_1 = 2000000000000000000UL;  // 2 R5
+__constant ulong REWARD_EPOCH_2 = 1000000000000000000UL;  // 1 R5
+__constant ulong REWARD_EPOCH_3 = 500000000000000000UL;   // 0.5 R5
+__constant ulong REWARD_EPOCH_4 = 250000000000000000UL;   // 0.25 R5
+__constant ulong REWARD_EPOCH_5 = 125000000000000000UL;   // 0.125 R5
+__constant ulong REWARD_EPOCH_6 = 62500000000000000UL;    // 0.0625 R5
+__constant ulong REWARD_EPOCH_7 = 31250000000000000UL;    // 0.03125 R5
 
 __attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
 __kernel void search(
@@ -350,13 +372,38 @@ __kernel void search(
 
             barrier(CLK_LOCAL_MEM_FENCE);
 
-#ifndef LEGACY
-#pragma unroll 1
-#endif
-            for (uint a = 0; a < ACCESSES; a += 8) {
-                const uint lane_idx = 4 * hash_id + a / 8 % 4;
-                for (uint x = 0; x < 8; ++x)
-                    MIX(x);
+            // R5 modification: Sequential dependency implementation
+            uint seq_dep = init0;
+            
+            for (uint a = 0; a < LOOP_ACCESSES; a++) {
+                const uint lane_idx = 4 * hash_id + a % 4;
+                
+                // Update sequential dependency with current mix value
+                seq_dep = fnv_seq_dep(seq_dep, ((uint *)&mix)[a % 8]);
+                
+                // Calculate parent index using sequential dependency
+                uint parent_idx = fnv(a ^ seq_dep, ((uint *)&mix)[a % 8]) % (dag_size / 128);
+                
+                // Set buffer with parent index
+                buffer[get_local_id(0)] = parent_idx;
+                mem_fence(CLK_LOCAL_MEM_FENCE);
+                
+                // Get index from buffer
+                uint idx = buffer[lane_idx];
+                __global hash128_t const* g_dag;
+                g_dag = (__global hash128_t const*) _g_dag0;
+                if (idx & 1)
+                    g_dag = (__global hash128_t const*) _g_dag1;
+                
+                // R5: Conditional update based on parity bit
+                if ((((uint *)&mix)[0] & 0x1) == 1) {
+                    ((uint *)&mix)[0] = fnv(((uint *)&mix)[0], g_dag[idx >> 1].uints[thread_id * 8]);
+                }
+                
+                // Mix with FNV for all elements
+                for (int k = 0; k < 8; k++) {
+                    ((uint *)&mix)[k] = fnv(((uint *)&mix)[k], g_dag[idx >> 1].uints[thread_id * 8 + k]);
+                }
             }
 
             barrier(CLK_LOCAL_MEM_FENCE);
@@ -379,6 +426,66 @@ __kernel void search(
         mixhash[1] = state[9];
         mixhash[2] = state[10];
         mixhash[3] = state[11];
+
+        // R5-specific: Apply the 4 extra mixing rounds
+        uint seqDep = mixhash[0].x;
+        
+        for (int round = 0; round < 4; round++) {
+            // Convert mixhash to array for easier manipulation
+            uint mixArray[8];
+            mixArray[0] = mixhash[0].x;
+            mixArray[1] = mixhash[0].y;
+            mixArray[2] = mixhash[1].x;
+            mixArray[3] = mixhash[1].y;
+            mixArray[4] = mixhash[2].x;
+            mixArray[5] = mixhash[2].y;
+            mixArray[6] = mixhash[3].x;
+            mixArray[7] = mixhash[3].y;
+            
+            // Sequential dependency inner loop
+            for (int k = 0; k < 3; k++) {
+                seqDep = fnv(seqDep, mixArray[k % 8]);
+            }
+            
+            // Update first element with sequential dependency
+            mixArray[0] = fnv(mixArray[0], seqDep);
+            
+            // FNV mix with neighbors
+            for (int i = 0; i < 8; i++) {
+                mixArray[i] = fnv(mixArray[i], mixArray[(i + 1) % 8]);
+            }
+            
+            // Data-dependent branch
+            if ((mixArray[0] & 1) == 0) {
+                // Rotation for even values
+                uint temp = mixArray[0];
+                for (int i = 0; i < 7; i++) {
+                    mixArray[i] = mixArray[i + 1];
+                }
+                mixArray[7] = temp;
+                
+                // Additional FNV mixing
+                for (int i = 0; i < 8; i++) {
+                    mixArray[i] = fnv(mixArray[i], mixArray[(i + 3) % 8]);
+                }
+            }
+            
+            // Convert back to mixhash format
+            mixhash[0].x = mixArray[0];
+            mixhash[0].y = mixArray[1];
+            mixhash[1].x = mixArray[2];
+            mixhash[1].y = mixArray[3];
+            mixhash[2].x = mixArray[4];
+            mixhash[2].y = mixArray[5];
+            mixhash[3].x = mixArray[6];
+            mixhash[3].y = mixArray[7];
+        }
+        
+        // Update state with the modified mixhash
+        state[8] = mixhash[0];
+        state[9] = mixhash[1];
+        state[10] = mixhash[2];
+        state[11] = mixhash[3];
 
         state[12] = as_uint2(0x0000000000000001UL);
         state[13] = (uint2)(0);
@@ -441,6 +548,26 @@ static void SHA3_512(uint2 *s)
         s[i] = st[i];
 }
 
+// Block reward calculation function
+ulong calculateBlockReward(uint blockNumber)
+{
+    if (blockNumber <= 4000000)
+        return REWARD_EPOCH_1;
+    else if (blockNumber <= 8000000)
+        return REWARD_EPOCH_2;
+    else if (blockNumber <= 16000000)
+        return REWARD_EPOCH_3;
+    else if (blockNumber <= 32000000)
+        return REWARD_EPOCH_4;
+    else if (blockNumber <= 64000000)
+        return REWARD_EPOCH_5;
+    else if (blockNumber <= 128000000)
+        return REWARD_EPOCH_6;
+    else
+        return REWARD_EPOCH_7;
+}
+
+// Using the EXACT same signature and implementation as the original code
 __kernel void GenerateDAG(uint start, __global const uint16 *_Cache, __global uint16 *_DAG0, __global uint16 *_DAG1, uint light_size)
 {
     __global const Node *Cache = (__global const Node *) _Cache;
